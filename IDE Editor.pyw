@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import csv
+import copy  # for deep copy in undo functionality
 
 # --- Global Constants ---
 
@@ -23,15 +24,18 @@ FLAGS = [
     ("2048", "(SA)Garage_door", "Object is a garage door"),
     ("2176", "(SA)Unkown", "Exclude_Surface_From_Culling+Unkown"),
     ("4096", "(SA)2-Clump-Object", "Object belongs to a clump"),
+    ("4100", "(SA)Alpha_Transparency_1+Unkown", "Object has first type of transparency"),
     ("8192", "(SA)Small-Vegetation-Strong-wind-Effect", "Small vegetation affected by strong wind"),
     ("16384", "(SA)Standard-Vegetation", "Standard vegetation object"),
     ("32768", "(SA)Timecycle-PoleShadow-Flag", "Used in timecycle pole shadows"),
+    ("32896", "Exclude_Surface_From_Culling+Unkown", "Exclude_Surface_From_Culling+Unkown"),
     ("65536", "(SA)Explosive", "Explosive object"),
     ("131072", "(SA)UNKNOWN-(Seems to be an SCM Flag)", "Uncertain flag, possibly an SCM flag"),
     ("262144", "(SA)UNKNOWN-(1 Object in Jizzy`s Club)", "Uncertain flag related to Jizzy's Club"),
     ("524288", "(SA)(SA)UNKNOWN-(?)", "Uncertain or unused flag"),
     ("1048576", "(SA)Graffiti", "Object is graffiti"),
     ("2097152", "(SA)Disable-backface-culling", "Disables backface culling"),
+    ("2130048", "Exclude_Surface_From_Culling+Unkown", "Exclude_Surface_From_Culling+Unkown"),
     ("2097280", "(SA)Unkown", "Disable-backface-culling+Unkown"),
     ("2097284", "(SA)Unkown", "Disable-backface-culling+Aplpha_Transparency_1+Unkown"),
     ("2097156", "(SA)Unkown", "Object has second type of transparency+Unkown"),
@@ -40,8 +44,6 @@ FLAGS = [
 ]
 
 IDE_COLUMNS = ("ID", "ModelName", "TextureName", "DrawDist", "Flags")
-
-# Precompute a lookup dictionary for flags (for faster lookup)
 FLAGS_DICT = {int(item[0]): (item[1], item[2]) for item in FLAGS}
 
 
@@ -49,16 +51,19 @@ FLAGS_DICT = {int(item[0]): (item[1], item[2]) for item in FLAGS}
 
 class IDEEditor:
     def __init__(self, root):
-        """Initialize the main editor and set up the UI."""
         self.root = root
         self.root.title("GTA SA IDE Editor")
-        self.ide_data = []  # List of dictionaries with IDE entries
-        self.sort_orders = {}  # Store sort order per column (True=ascending, False=descending)
+        self.ide_data = []          # List of IDE entries (each is a dict)
+        self.sort_orders = {}       # Store sort order per column (True=ascending)
+        self.current_file = None    # Current opened file
+        self.undo_stack = []        # Stack to store previous states for undo
         self.create_widgets()
 
     def create_widgets(self):
-        """Create and layout all UI widgets."""
-        # === Search & Filter Frame ===
+        """Initialize UI components and menu bar."""
+        self.create_menu()  # New menu bar added
+
+        # --- Search & Filter Frame ---
         search_frame = ttk.Frame(self.root)
         search_frame.pack(fill=tk.X, pady=5, padx=5)
 
@@ -74,37 +79,28 @@ class IDEEditor:
         self.flag_filter_combobox.pack(side=tk.LEFT, padx=5)
         self.flag_filter_combobox.bind("<<ComboboxSelected>>", lambda e: self.update_tree())
 
-        # Button to clear filters quickly.
         ttk.Button(search_frame, text="Clear Filter", command=self.clear_filter).pack(side=tk.LEFT, padx=5)
 
-        # === Treeview Frame ===
+        # --- Treeview Frame ---
         tree_frame = ttk.Frame(self.root)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        self.tree = ttk.Treeview(tree_frame, columns=IDE_COLUMNS, show="headings")
+        self.tree = ttk.Treeview(tree_frame, columns=IDE_COLUMNS, show="headings", selectmode="extended")
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # Setup columns and add header click for sorting.
         for col in IDE_COLUMNS:
             self.tree.heading(col, text=col, command=lambda _col=col: self.sort_tree(_col))
             self.tree.column(col, width=100, anchor="center")
-
-        # Bind selection to load data into edit fields.
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
-
-        # Add vertical scrollbar.
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscroll=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # === Status Bar ===
+        # --- Status Bar ---
         self.status_label = ttk.Label(self.root, text="No entries loaded.", relief=tk.SUNKEN, anchor=tk.W)
         self.status_label.pack(fill=tk.X, padx=5, pady=(0, 5))
 
-        # === Buttons Frame ===
+        # --- Buttons Frame ---
         buttons_frame = ttk.Frame(self.root)
         buttons_frame.pack(fill=tk.X, pady=5, padx=5)
-
         ttk.Button(buttons_frame, text="Open IDE File", command=self.open_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Save IDE File", command=self.save_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Export to CSV", command=self.export_csv).pack(side=tk.LEFT, padx=5)
@@ -114,15 +110,14 @@ class IDEEditor:
         self.start_id_entry.pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Renumber IDs", command=self.renumber_ids).pack(side=tk.LEFT, padx=5)
 
-        # New Entry management buttons.
         ttk.Button(buttons_frame, text="Add Entry", command=self.add_entry).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Delete Entry", command=self.delete_entry).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Duplicate Entry", command=self.duplicate_entry).pack(side=tk.LEFT, padx=5)
+        ttk.Button(buttons_frame, text="Undo", command=self.undo).pack(side=tk.LEFT, padx=5)
 
-        # === Edit Frame ===
+        # --- Edit Frame ---
         edit_frame = ttk.Frame(self.root)
         edit_frame.pack(fill=tk.X, pady=10, padx=5)
-
         ttk.Label(edit_frame, text="Model Name:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
         self.model_name_entry = ttk.Entry(edit_frame)
         self.model_name_entry.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
@@ -141,65 +136,93 @@ class IDEEditor:
         self.flag_combobox.grid(row=1, column=3, padx=5, pady=2, sticky=tk.W)
         self.flag_combobox.bind("<<ComboboxSelected>>", self.update_flag_description)
 
-        # Label to show the flag description.
         self.flag_description_label = ttk.Label(edit_frame, text="Flag Description: ")
         self.flag_description_label.grid(row=2, column=0, columnspan=4, padx=5, pady=2, sticky=tk.W)
-
         ttk.Button(edit_frame, text="Save Edits", command=self.save_edits).grid(row=3, column=0, columnspan=4, pady=5)
 
-    # --- File Operations ---
+    def create_menu(self):
+        """Create a simple menu bar for file and edit operations."""
+        menubar = tk.Menu(self.root)
+        # File Menu
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Open IDE File", command=self.open_file)
+        file_menu.add_command(label="Save IDE File", command=self.save_file)
+        file_menu.add_separator()
+        file_menu.add_command(label="Export to CSV", command=self.export_csv)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.quit)
+        menubar.add_cascade(label="File", menu=file_menu)
+        # Edit Menu
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        edit_menu.add_command(label="Undo", command=self.undo)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+        self.root.config(menu=menubar)
 
+    # --- File Operations ---
+    
     def open_file(self):
-        """Open an IDE file and load its contents."""
         filepath = filedialog.askopenfilename(
             filetypes=[("IDE Files", "*.ide"), ("All Files", "*.*")]
         )
         if filepath:
+            self.current_file = filepath
             self.ide_data = self.read_ide_file(filepath)
             self.update_tree()
 
     def read_ide_file(self, filepath):
-        """
-        Read an IDE file and return a list of IDE entry dictionaries.
-        Each valid line should have 5 comma-separated values.
-        """
         ide_data = []
         try:
             with open(filepath, "r") as file:
                 for line in file:
                     stripped = line.strip()
-                    # Skip empty lines and section markers.
                     if not stripped or stripped.lower() in ("objs", "end"):
                         continue
                     parts = [part.strip() for part in stripped.split(",")]
-                    if len(parts) != 5:
-                        continue
-                    try:
-                        entry = {
-                            "ID": int(parts[0]),
-                            "ModelName": parts[1],
-                            "TextureName": parts[2],
-                            "DrawDist": float(parts[3]),
-                            "Flags": int(parts[4])
-                        }
+                    if len(parts) in (5, 6):
+                        try:
+                            id_val = int(parts[0])
+                        except ValueError:
+                            continue
+                        model = parts[1]
+                        texture = parts[2]
+                        # For 5 columns: parts[3] is DrawDist, parts[4] is Flags
+                        if len(parts) == 5:
+                            try:
+                                drawdist = float(parts[3])
+                            except ValueError:
+                                drawdist = 0.0
+                            try:
+                                flag = int(parts[4])
+                            except ValueError:
+                                flag = 0
+                        # For 6 columns (GTA III): parts[3] is Flags, parts[4] is DrawDist
+                        else:
+                            try:
+                                flag = int(parts[3])
+                            except ValueError:
+                                flag = 0
+                            try:
+                                drawdist = float(parts[4])
+                            except ValueError:
+                                drawdist = 0.0
+                        entry = {"ID": id_val, "ModelName": model, "TextureName": texture, "DrawDist": drawdist, "Flags": flag}
                         ide_data.append(entry)
-                    except ValueError:
-                        continue  # Skip lines with conversion errors.
         except Exception as e:
             messagebox.showerror("Error", f"Error reading IDE file: {e}")
         return ide_data
 
     def save_file(self):
-        """Save the current IDE data to a file."""
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".ide",
-            filetypes=[("IDE Files", "*.ide"), ("All Files", "*.*")],
-        )
-        if filepath:
-            self.write_ide_file(filepath)
+        if self.current_file:
+            self.write_ide_file(self.current_file)
+        else:
+            self.current_file = filedialog.asksaveasfilename(
+                defaultextension=".ide",
+                filetypes=[("IDE Files", "*.ide"), ("All Files", "*.*")]
+            )
+            if self.current_file:
+                self.write_ide_file(self.current_file)
 
     def write_ide_file(self, filepath):
-        """Write the IDE data to the specified file."""
         try:
             with open(filepath, "w") as file:
                 file.write("objs\n")
@@ -211,10 +234,9 @@ class IDEEditor:
             messagebox.showerror("Error", f"Error saving IDE file: {e}")
 
     def export_csv(self):
-        """Export the current IDE data to a CSV file."""
         filepath = filedialog.asksaveasfilename(
             defaultextension=".csv",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
         )
         if not filepath:
             return
@@ -237,28 +259,17 @@ class IDEEditor:
     # --- Filtering, Sorting & Treeview Updates ---
 
     def clear_filter(self):
-        """Reset search and flag filter."""
         self.search_entry.delete(0, tk.END)
         self.flag_filter_combobox.current(0)
         self.update_tree()
 
     def get_filtered_data(self):
-        """
-        Filter the IDE data based on search text and flag selection.
-        Returns a list of tuples: (index, entry).
-        """
         search_text = self.search_entry.get().lower().strip()
         flag_filter = self.flag_filter_combobox.get()
         filtered = []
         for idx, entry in enumerate(self.ide_data):
-            # Filter by search text in ModelName or TextureName.
-            if search_text and (
-                search_text not in entry["ModelName"].lower() and
-                search_text not in entry["TextureName"].lower()
-            ):
+            if search_text and (search_text not in entry["ModelName"].lower() and search_text not in entry["TextureName"].lower()):
                 continue
-
-            # Filter by flag if not 'All'
             if flag_filter != "All":
                 try:
                     flag_value = int(flag_filter.split(" - ")[0])
@@ -270,44 +281,31 @@ class IDEEditor:
         return filtered
 
     def update_tree(self):
-        """Refresh the treeview based on current filters."""
         self.tree.delete(*self.tree.get_children())
         filtered = self.get_filtered_data()
         for idx, entry in filtered:
-            self.tree.insert(
-                "",
-                "end",
-                iid=str(idx),  # Use index as tree item id.
-                values=(
-                    entry["ID"],
-                    entry["ModelName"],
-                    entry["TextureName"],
-                    entry["DrawDist"],
-                    entry["Flags"],
-                ),
-            )
-        # Update status bar.
+            self.tree.insert("", "end", iid=str(idx), values=(
+                entry["ID"],
+                entry["ModelName"],
+                entry["TextureName"],
+                entry["DrawDist"],
+                entry["Flags"],
+            ))
         self.status_label.config(text=f"Showing {len(filtered)} of {len(self.ide_data)} entries.")
 
     def sort_tree(self, col):
-        """Sort the IDE data by the given column and update the treeview."""
-        # Determine sort order (toggle between ascending and descending).
         ascending = self.sort_orders.get(col, True)
         self.sort_orders[col] = not ascending
-
         try:
-            # Sort using the column's value.
             self.ide_data.sort(key=lambda x: x[col] if col in x else "", reverse=not ascending)
         except Exception as e:
             messagebox.showerror("Error", f"Error sorting by {col}: {e}")
             return
-
         self.update_tree()
 
     # --- Editing and Flag Description ---
 
     def on_tree_select(self, event):
-        """Populate edit fields when a tree item is selected."""
         selected = self.tree.selection()
         if not selected:
             return
@@ -315,28 +313,21 @@ class IDEEditor:
             idx = int(selected[0])
         except ValueError:
             return
-
         entry = self.ide_data[idx]
         self.model_name_entry.delete(0, tk.END)
         self.model_name_entry.insert(0, entry["ModelName"])
-
         self.texture_name_entry.delete(0, tk.END)
         self.texture_name_entry.insert(0, entry["TextureName"])
-
         self.draw_dist_entry.delete(0, tk.END)
         self.draw_dist_entry.insert(0, entry["DrawDist"])
-
-        # Set flag combobox and update flag description.
         flag_name = self.get_flag_name(entry["Flags"])
         self.flag_combobox.set(f"{entry['Flags']} - {flag_name}")
         self.update_flag_description(None)
 
     def get_flag_name(self, flag_value):
-        """Return the human‑readable flag name for a numeric flag value."""
         return FLAGS_DICT.get(flag_value, ("Unknown", "No description available"))[0]
 
     def update_flag_description(self, event):
-        """Update the flag description label based on the selected flag."""
         flag_text = self.flag_combobox.get()
         try:
             flag_value = int(flag_text.split(" - ")[0])
@@ -347,15 +338,15 @@ class IDEEditor:
         self.flag_description_label.config(text=f"Flag Description: {desc}")
 
     def save_edits(self):
-        """Save changes made in the edit fields back to the selected IDE entry."""
         selected = self.tree.selection()
         if not selected:
             return
-
         try:
             idx = int(selected[0])
         except ValueError:
             return
+        # Save current state for undo
+        self.push_undo_state()
 
         model_name = self.model_name_entry.get().strip()
         texture_name = self.texture_name_entry.get().strip()
@@ -364,23 +355,18 @@ class IDEEditor:
         except ValueError:
             messagebox.showerror("Error", "Invalid draw distance. Please enter a number.")
             return
-
         flag_text = self.flag_combobox.get()
         try:
             flag = int(flag_text.split(" - ")[0])
         except ValueError:
-            messagebox.showerror("Error", "Invalid flag selection.")
-            return
+            flag = 0
 
-        # Update the underlying data.
         self.ide_data[idx].update({
             "ModelName": model_name,
             "TextureName": texture_name,
             "DrawDist": draw_dist,
             "Flags": flag
         })
-
-        # Update the tree view item.
         self.tree.item(selected[0], values=(
             self.ide_data[idx]["ID"],
             model_name,
@@ -390,10 +376,27 @@ class IDEEditor:
         ))
         messagebox.showinfo("Info", "Entry updated successfully.")
 
+    # --- Undo Functionality ---
+
+    def push_undo_state(self):
+        # Save a deep copy of ide_data for undo.
+        self.undo_stack.append(copy.deepcopy(self.ide_data))
+        # Limit the undo stack size if desired.
+        if len(self.undo_stack) > 20:
+            self.undo_stack.pop(0)
+
+    def undo(self):
+        if self.undo_stack:
+            self.ide_data = self.undo_stack.pop()
+            self.update_tree()
+            messagebox.showinfo("Undo", "Reverted to previous state.")
+        else:
+            messagebox.showinfo("Undo", "No more actions to undo.")
+
     # --- Entry Management ---
 
     def add_entry(self):
-        """Add a new IDE entry with default values."""
+        self.push_undo_state()
         new_id = max((entry["ID"] for entry in self.ide_data), default=0) + 1
         new_entry = {"ID": new_id, "ModelName": "NewModel", "TextureName": "NewTexture", "DrawDist": 0.0, "Flags": 0}
         self.ide_data.append(new_entry)
@@ -401,23 +404,19 @@ class IDEEditor:
         messagebox.showinfo("Info", "New entry added.")
 
     def delete_entry(self):
-        """Delete the selected IDE entry."""
         selected = self.tree.selection()
         if not selected:
             messagebox.showwarning("Warning", "No entry selected for deletion.")
             return
-        try:
-            idx = int(selected[0])
-        except ValueError:
-            return
-        # Confirm deletion.
-        if messagebox.askyesno("Confirm", "Are you sure you want to delete this entry?"):
-            del self.ide_data[idx]
+        if messagebox.askyesno("Confirm", f"Are you sure you want to delete {len(selected)} entries?"):
+            self.push_undo_state()
+            indices = sorted([int(item) for item in selected], reverse=True)
+            for idx in indices:
+                del self.ide_data[idx]
             self.update_tree()
-            messagebox.showinfo("Info", "Entry deleted.")
+            messagebox.showinfo("Info", f"{len(indices)} entries deleted.")
 
     def duplicate_entry(self):
-        """Duplicate the selected IDE entry (assigning a new ID)."""
         selected = self.tree.selection()
         if not selected:
             messagebox.showwarning("Warning", "No entry selected for duplication.")
@@ -426,6 +425,7 @@ class IDEEditor:
             idx = int(selected[0])
         except ValueError:
             return
+        self.push_undo_state()
         orig = self.ide_data[idx]
         new_id = max((entry["ID"] for entry in self.ide_data), default=0) + 1
         new_entry = {
@@ -440,8 +440,8 @@ class IDEEditor:
         messagebox.showinfo("Info", "Entry duplicated.")
 
     def renumber_ids(self):
-        """Renumber the IDE entry IDs starting from the specified value."""
         try:
+            self.push_undo_state()
             start_id = int(self.start_id_entry.get().strip())
             for i, entry in enumerate(self.ide_data):
                 entry["ID"] = start_id + i
