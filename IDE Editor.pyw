@@ -1,10 +1,15 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import csv
-import copy  # for deep copy in undo functionality
+import json
+import copy
+import logging
+from dataclasses import dataclass, asdict, field
+
+# --- Configure logging ---
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
 
 # --- Global Constants ---
-
 FLAGS = [
     ("0", "(SA)Default", "No special flags"),
     ("1", "(SA)Render_Wet_Effects", "Object is rendered with wet effects"),
@@ -42,26 +47,51 @@ FLAGS = [
     ("4194304", "(SA)UNKNOWN-Unused-(Parts of a statue in Atrium)", "Unused flag related to a statue"),
     ("1073741824", "(SA)Unknown", "An unknown flag")
 ]
-
 IDE_COLUMNS = ("ID", "ModelName", "TextureName", "DrawDist", "Flags")
 FLAGS_DICT = {int(item[0]): (item[1], item[2]) for item in FLAGS}
 
 
-# --- Main Application Class ---
+# --- Data Class for IDE Entries ---
+@dataclass
+class IDEEntry:
+    ID: int
+    ModelName: str
+    TextureName: str
+    DrawDist: float
+    Flags: int
 
+    def to_list(self):
+        return [self.ID, self.ModelName, self.TextureName, self.DrawDist, self.Flags]
+
+
+# --- Main Application Class ---
 class IDEEditor:
     def __init__(self, root):
         self.root = root
         self.root.title("GTA SA IDE Editor")
-        self.ide_data = []          # List of IDE entries (each is a dict)
-        self.sort_orders = {}       # Store sort order per column (True=ascending)
-        self.current_file = None    # Current opened file
-        self.undo_stack = []        # Stack to store previous states for undo
+        self.ide_data: list[IDEEntry] = []          # List of IDEEntry objects
+        self.sort_orders = {}                       # Store sort order per column (True=ascending)
+        self.current_file = None                    # Currently opened file path
+        self.undo_stack: list[list[IDEEntry]] = []    # Undo stack storing lists of IDEEntry
+        self.redo_stack: list[list[IDEEntry]] = []    # Redo stack for redo functionality
+        self.unsaved_changes = False                # Flag to track unsaved changes
+
         self.create_widgets()
+        self.bind_events()
+
+    def bind_events(self):
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.bind_all("<Control-z>", lambda e: self.undo())
+        self.root.bind_all("<Control-y>", lambda e: self.redo())
+
+    def on_closing(self):
+        if self.unsaved_changes:
+            if not messagebox.askokcancel("Quit", "You have unsaved changes. Quit anyway?"):
+                return
+        self.root.destroy()
 
     def create_widgets(self):
-        """Initialize UI components and menu bar."""
-        self.create_menu()  # New menu bar added
+        self.create_menu()
 
         # --- Search & Filter Frame ---
         search_frame = ttk.Frame(self.root)
@@ -90,6 +120,8 @@ class IDEEditor:
             self.tree.heading(col, text=col, command=lambda _col=col: self.sort_tree(_col))
             self.tree.column(col, width=100, anchor="center")
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        # Right-click context menu
+        self.tree.bind("<Button-3>", self.show_context_menu)
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscroll=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -104,6 +136,7 @@ class IDEEditor:
         ttk.Button(buttons_frame, text="Open IDE File", command=self.open_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Save IDE File", command=self.save_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Export to CSV", command=self.export_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(buttons_frame, text="Export as JSON", command=self.export_json).pack(side=tk.LEFT, padx=5)
 
         ttk.Label(buttons_frame, text="Start ID:").pack(side=tk.LEFT, padx=5)
         self.start_id_entry = ttk.Entry(buttons_frame, width=10)
@@ -113,7 +146,10 @@ class IDEEditor:
         ttk.Button(buttons_frame, text="Add Entry", command=self.add_entry).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Delete Entry", command=self.delete_entry).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Duplicate Entry", command=self.duplicate_entry).pack(side=tk.LEFT, padx=5)
+        ttk.Button(buttons_frame, text="Bulk Edit", command=self.bulk_edit_entries).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Undo", command=self.undo).pack(side=tk.LEFT, padx=5)
+        ttk.Button(buttons_frame, text="Redo", command=self.redo).pack(side=tk.LEFT, padx=5)
+        ttk.Button(buttons_frame, text="Find & Replace", command=self.find_and_replace).pack(side=tk.LEFT, padx=5)
 
         # --- Edit Frame ---
         edit_frame = ttk.Frame(self.root)
@@ -141,7 +177,6 @@ class IDEEditor:
         ttk.Button(edit_frame, text="Save Edits", command=self.save_edits).grid(row=3, column=0, columnspan=4, pady=5)
 
     def create_menu(self):
-        """Create a simple menu bar for file and edit operations."""
         menubar = tk.Menu(self.root)
         # File Menu
         file_menu = tk.Menu(menubar, tearoff=0)
@@ -149,27 +184,45 @@ class IDEEditor:
         file_menu.add_command(label="Save IDE File", command=self.save_file)
         file_menu.add_separator()
         file_menu.add_command(label="Export to CSV", command=self.export_csv)
+        file_menu.add_command(label="Export as JSON", command=self.export_json)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        file_menu.add_command(label="Exit", command=self.on_closing)
         menubar.add_cascade(label="File", menu=file_menu)
         # Edit Menu
         edit_menu = tk.Menu(menubar, tearoff=0)
-        edit_menu.add_command(label="Undo", command=self.undo)
+        edit_menu.add_command(label="Undo", command=self.undo, accelerator="Ctrl+Z")
+        edit_menu.add_command(label="Redo", command=self.redo, accelerator="Ctrl+Y")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Find & Replace", command=self.find_and_replace)
+        edit_menu.add_command(label="Bulk Edit", command=self.bulk_edit_entries)
         menubar.add_cascade(label="Edit", menu=edit_menu)
+        # Help Menu
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
         self.root.config(menu=menubar)
 
+    def show_about(self):
+        messagebox.showinfo("About", "GTA SA IDE Editor\nVersion 2.0\nOptimized with Undo/Redo, new Find & Replace, Bulk Edit, JSON export, and context menus.")
+
     # --- File Operations ---
-    
+
     def open_file(self):
+        if self.unsaved_changes:
+            if not messagebox.askyesno("Confirm", "You have unsaved changes. Continue and discard changes?"):
+                return
         filepath = filedialog.askopenfilename(
             filetypes=[("IDE Files", "*.ide"), ("All Files", "*.*")]
         )
         if filepath:
             self.current_file = filepath
             self.ide_data = self.read_ide_file(filepath)
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self.unsaved_changes = False
             self.update_tree()
 
-    def read_ide_file(self, filepath):
+    def read_ide_file(self, filepath) -> list[IDEEntry]:
         ide_data = []
         try:
             with open(filepath, "r") as file:
@@ -181,53 +234,41 @@ class IDEEditor:
                     if len(parts) in (5, 6):
                         try:
                             id_val = int(parts[0])
+                            model = parts[1]
+                            texture = parts[2]
+                            # Determine order based on parts count
+                            if len(parts) == 5:
+                                drawdist = float(parts[3]) if parts[3] else 0.0
+                                flag = int(parts[4]) if parts[4] else 0
+                            else:
+                                flag = int(parts[3]) if parts[3] else 0
+                                drawdist = float(parts[4]) if parts[4] else 0.0
+                            entry = IDEEntry(id_val, model, texture, drawdist, flag)
+                            ide_data.append(entry)
                         except ValueError:
+                            logging.warning("Skipping invalid line: %s", line)
                             continue
-                        model = parts[1]
-                        texture = parts[2]
-                        # For 5 columns: parts[3] is DrawDist, parts[4] is Flags
-                        if len(parts) == 5:
-                            try:
-                                drawdist = float(parts[3])
-                            except ValueError:
-                                drawdist = 0.0
-                            try:
-                                flag = int(parts[4])
-                            except ValueError:
-                                flag = 0
-                        # For 6 columns (GTA III): parts[3] is Flags, parts[4] is DrawDist
-                        else:
-                            try:
-                                flag = int(parts[3])
-                            except ValueError:
-                                flag = 0
-                            try:
-                                drawdist = float(parts[4])
-                            except ValueError:
-                                drawdist = 0.0
-                        entry = {"ID": id_val, "ModelName": model, "TextureName": texture, "DrawDist": drawdist, "Flags": flag}
-                        ide_data.append(entry)
         except Exception as e:
             messagebox.showerror("Error", f"Error reading IDE file: {e}")
         return ide_data
 
     def save_file(self):
-        if self.current_file:
-            self.write_ide_file(self.current_file)
-        else:
+        if not self.current_file:
             self.current_file = filedialog.asksaveasfilename(
                 defaultextension=".ide",
                 filetypes=[("IDE Files", "*.ide"), ("All Files", "*.*")]
             )
-            if self.current_file:
-                self.write_ide_file(self.current_file)
+            if not self.current_file:
+                return
+        self.write_ide_file(self.current_file)
+        self.unsaved_changes = False
 
     def write_ide_file(self, filepath):
         try:
             with open(filepath, "w") as file:
                 file.write("objs\n")
                 for entry in self.ide_data:
-                    file.write(f"{entry['ID']}, {entry['ModelName']}, {entry['TextureName']}, {entry['DrawDist']}, {entry['Flags']}\n")
+                    file.write(f"{entry.ID}, {entry.ModelName}, {entry.TextureName}, {entry.DrawDist}, {entry.Flags}\n")
                 file.write("end")
             messagebox.showinfo("Success", "File saved successfully!")
         except Exception as e:
@@ -245,16 +286,24 @@ class IDEEditor:
                 writer = csv.DictWriter(csvfile, fieldnames=IDE_COLUMNS)
                 writer.writeheader()
                 for entry in self.ide_data:
-                    writer.writerow({
-                        "ID": entry["ID"],
-                        "ModelName": entry["ModelName"],
-                        "TextureName": entry["TextureName"],
-                        "DrawDist": entry["DrawDist"],
-                        "Flags": entry["Flags"]
-                    })
+                    writer.writerow(asdict(entry))
             messagebox.showinfo("Success", "CSV file exported successfully!")
         except Exception as e:
             messagebox.showerror("Error", f"Error exporting CSV file: {e}")
+
+    def export_json(self):
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, "w") as jsonfile:
+                json.dump([asdict(entry) for entry in self.ide_data], jsonfile, indent=4)
+            messagebox.showinfo("Success", "JSON file exported successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error exporting JSON file: {e}")
 
     # --- Filtering, Sorting & Treeview Updates ---
 
@@ -268,14 +317,14 @@ class IDEEditor:
         flag_filter = self.flag_filter_combobox.get()
         filtered = []
         for idx, entry in enumerate(self.ide_data):
-            if search_text and (search_text not in entry["ModelName"].lower() and search_text not in entry["TextureName"].lower()):
+            if search_text and (search_text not in entry.ModelName.lower() and search_text not in entry.TextureName.lower()):
                 continue
             if flag_filter != "All":
                 try:
                     flag_value = int(flag_filter.split(" - ")[0])
                 except ValueError:
                     continue
-                if entry["Flags"] != flag_value:
+                if entry.Flags != flag_value:
                     continue
             filtered.append((idx, entry))
         return filtered
@@ -284,27 +333,24 @@ class IDEEditor:
         self.tree.delete(*self.tree.get_children())
         filtered = self.get_filtered_data()
         for idx, entry in filtered:
-            self.tree.insert("", "end", iid=str(idx), values=(
-                entry["ID"],
-                entry["ModelName"],
-                entry["TextureName"],
-                entry["DrawDist"],
-                entry["Flags"],
-            ))
+            self.tree.insert("", "end", iid=str(idx), values=entry.to_list())
         self.status_label.config(text=f"Showing {len(filtered)} of {len(self.ide_data)} entries.")
 
     def sort_tree(self, col):
         ascending = self.sort_orders.get(col, True)
         self.sort_orders[col] = not ascending
+
         try:
-            self.ide_data.sort(key=lambda x: x[col] if col in x else "", reverse=not ascending)
+            if col in ("ID", "DrawDist", "Flags"):
+                self.ide_data.sort(key=lambda x: float(getattr(x, col)), reverse=not ascending)
+            else:
+                self.ide_data.sort(key=lambda x: getattr(x, col).lower(), reverse=not ascending)
         except Exception as e:
             messagebox.showerror("Error", f"Error sorting by {col}: {e}")
             return
         self.update_tree()
 
     # --- Editing and Flag Description ---
-
     def on_tree_select(self, event):
         selected = self.tree.selection()
         if not selected:
@@ -315,13 +361,13 @@ class IDEEditor:
             return
         entry = self.ide_data[idx]
         self.model_name_entry.delete(0, tk.END)
-        self.model_name_entry.insert(0, entry["ModelName"])
+        self.model_name_entry.insert(0, entry.ModelName)
         self.texture_name_entry.delete(0, tk.END)
-        self.texture_name_entry.insert(0, entry["TextureName"])
+        self.texture_name_entry.insert(0, entry.TextureName)
         self.draw_dist_entry.delete(0, tk.END)
-        self.draw_dist_entry.insert(0, entry["DrawDist"])
-        flag_name = self.get_flag_name(entry["Flags"])
-        self.flag_combobox.set(f"{entry['Flags']} - {flag_name}")
+        self.draw_dist_entry.insert(0, entry.DrawDist)
+        flag_name = self.get_flag_name(entry.Flags)
+        self.flag_combobox.set(f"{entry.Flags} - {flag_name}")
         self.update_flag_description(None)
 
     def get_flag_name(self, flag_value):
@@ -345,7 +391,7 @@ class IDEEditor:
             idx = int(selected[0])
         except ValueError:
             return
-        # Save current state for undo
+
         self.push_undo_state()
 
         model_name = self.model_name_entry.get().strip()
@@ -361,44 +407,49 @@ class IDEEditor:
         except ValueError:
             flag = 0
 
-        self.ide_data[idx].update({
-            "ModelName": model_name,
-            "TextureName": texture_name,
-            "DrawDist": draw_dist,
-            "Flags": flag
-        })
-        self.tree.item(selected[0], values=(
-            self.ide_data[idx]["ID"],
-            model_name,
-            texture_name,
-            draw_dist,
-            flag,
-        ))
+        # Update the IDEEntry object
+        self.ide_data[idx].ModelName = model_name
+        self.ide_data[idx].TextureName = texture_name
+        self.ide_data[idx].DrawDist = draw_dist
+        self.ide_data[idx].Flags = flag
+
+        self.tree.item(selected[0], values=self.ide_data[idx].to_list())
         messagebox.showinfo("Info", "Entry updated successfully.")
+        self.unsaved_changes = True
 
-    # --- Undo Functionality ---
-
+    # --- Undo/Redo Functionality ---
     def push_undo_state(self):
-        # Save a deep copy of ide_data for undo.
         self.undo_stack.append(copy.deepcopy(self.ide_data))
-        # Limit the undo stack size if desired.
         if len(self.undo_stack) > 20:
             self.undo_stack.pop(0)
+        self.redo_stack.clear()
+        self.unsaved_changes = True
 
-    def undo(self):
+    def undo(self, event=None):
         if self.undo_stack:
+            self.redo_stack.append(copy.deepcopy(self.ide_data))
             self.ide_data = self.undo_stack.pop()
             self.update_tree()
             messagebox.showinfo("Undo", "Reverted to previous state.")
+            self.unsaved_changes = True
         else:
             messagebox.showinfo("Undo", "No more actions to undo.")
 
-    # --- Entry Management ---
+    def redo(self, event=None):
+        if self.redo_stack:
+            self.undo_stack.append(copy.deepcopy(self.ide_data))
+            self.ide_data = self.redo_stack.pop()
+            self.update_tree()
+            messagebox.showinfo("Redo", "Redo successful.")
+            self.unsaved_changes = True
+        else:
+            messagebox.showinfo("Redo", "No actions to redo.")
 
+    # --- Entry Management ---
     def add_entry(self):
         self.push_undo_state()
-        new_id = max((entry["ID"] for entry in self.ide_data), default=0) + 1
-        new_entry = {"ID": new_id, "ModelName": "NewModel", "TextureName": "NewTexture", "DrawDist": 0.0, "Flags": 0}
+        new_id = max((entry.ID for entry in self.ide_data), default=0) + 1
+        new_entry = IDEEntry(new_id, "NewModel", "NewTexture", 0.0, 0)
         self.ide_data.append(new_entry)
         self.update_tree()
         messagebox.showinfo("Info", "New entry added.")
@@ -427,14 +478,8 @@ class IDEEditor:
             return
         self.push_undo_state()
         orig = self.ide_data[idx]
-        new_id = max((entry["ID"] for entry in self.ide_data), default=0) + 1
-        new_entry = {
-            "ID": new_id,
-            "ModelName": orig["ModelName"],
-            "TextureName": orig["TextureName"],
-            "DrawDist": orig["DrawDist"],
-            "Flags": orig["Flags"]
-        }
+        new_id = max((entry.ID for entry in self.ide_data), default=0) + 1
+        new_entry = IDEEntry(new_id, orig.ModelName, orig.TextureName, orig.DrawDist, orig.Flags)
         self.ide_data.append(new_entry)
         self.update_tree()
         messagebox.showinfo("Info", "Entry duplicated.")
@@ -444,10 +489,65 @@ class IDEEditor:
             self.push_undo_state()
             start_id = int(self.start_id_entry.get().strip())
             for i, entry in enumerate(self.ide_data):
-                entry["ID"] = start_id + i
+                entry.ID = start_id + i
             self.update_tree()
         except ValueError:
             messagebox.showerror("Error", "Invalid ID. Please enter a valid number.")
+
+    # --- New Feature: Bulk Edit ---
+    def bulk_edit_entries(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "No entries selected for bulk edit.")
+            return
+
+        # Ask for new ModelName as an example; extendable to other fields.
+        new_model = simpledialog.askstring("Bulk Edit", "Enter new Model Name for selected entries:")
+        if new_model is None:
+            return
+
+        self.push_undo_state()
+        for sid in selected:
+            try:
+                idx = int(sid)
+                self.ide_data[idx].ModelName = new_model
+            except ValueError:
+                continue
+        self.update_tree()
+        messagebox.showinfo("Bulk Edit", "Selected entries updated.")
+
+    # --- New Feature: Find & Replace ---
+    def find_and_replace(self):
+        find_str = simpledialog.askstring("Find & Replace", "Find:")
+        if find_str is None or find_str == "":
+            return
+        replace_str = simpledialog.askstring("Find & Replace", "Replace with:")
+        if replace_str is None:
+            return
+
+        count = 0
+        self.push_undo_state()
+        for entry in self.ide_data:
+            # Replace in ModelName and TextureName as an example.
+            if find_str.lower() in entry.ModelName.lower():
+                entry.ModelName = entry.ModelName.replace(find_str, replace_str)
+                count += 1
+            if find_str.lower() in entry.TextureName.lower():
+                entry.TextureName = entry.TextureName.replace(find_str, replace_str)
+                count += 1
+        self.update_tree()
+        messagebox.showinfo("Find & Replace", f"Replaced {count} occurrences.")
+
+    # --- Context Menu for Treeview ---
+    def show_context_menu(self, event):
+        try:
+            self.tree.selection_set(self.tree.identify_row(event.y))
+            menu = tk.Menu(self.root, tearoff=0)
+            menu.add_command(label="Duplicate Entry", command=self.duplicate_entry)
+            menu.add_command(label="Delete Entry", command=self.delete_entry)
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
 
 if __name__ == "__main__":
